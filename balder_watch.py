@@ -8,6 +8,7 @@
   TELEGRAM_CHAT_ID    id чата, куда слать сообщения
   DRY_RUN=1           ничего не отправлять, только печатать в консоль
 """
+import hashlib
 import html
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,25 +27,45 @@ SEARCH_URL = (
     "?x-typesense-api-key=yq3N83M%2BhBBSMsj48%2FzW3ZSgA7rloVAhrtVR5J3g4Dk%3D"
 )
 
-# Районы, за которыми следим. Формат такой же, как в запросе сайта.
-MUNICIPALITIES = ["stockholm > sundbyberg", "stockholm > järfälla"]
+# ───────────────────────── НАСТРОЙКИ ─────────────────────────
+# True  = следить за всем Stockholms län
+# False = только за районами из списка MUNICIPALITIES ниже
+WHOLE_COUNTY = True
+COUNTY = "stockholm"
+MUNICIPALITIES = [
+    "stockholm > sundbyberg",
+    "stockholm > järfälla",
+    "stockholm > botkyrka",  # Tumba; написание по аналогии, проверяется сообщением при запуске
+]
+# Можно менять эти настройки в любой момент: при изменении фильтра бот
+# тихо запомнит текущие объекты и не завалит тебя старыми квартирами.
+# ──────────────────────────────────────────────────────────────
 
-LIST_PAGE = (
-    "https://www.balder.se/lediga-lagenheter?"
-    + "&".join(
-        "locationRefinements%5Blocation%5D%5Blocation.municipality%5D%5B{}%5D={}".format(
-            i, urllib.parse.quote(m)
-        )
-        for i, m in enumerate(MUNICIPALITIES)
-    )
-)
-
+PER_PAGE = 250
+MAX_PAGES = 10
 STATE_FILE = Path(__file__).with_name("seen.json")
 TZ = ZoneInfo("Europe/Stockholm")
 
 
-def build_payload() -> dict:
+def location_filter() -> str:
+    if WHOLE_COUNTY:
+        return f"(location.county:=[`{COUNTY}`])"
     munis = ",".join(f"`{m}`" for m in MUNICIPALITIES)
+    return f"(location.municipality:=[{munis}])"
+
+
+def filter_signature() -> str:
+    """Короткий отпечаток текущего фильтра, чтобы заметить его смену."""
+    return hashlib.sha1(location_filter().encode("utf-8")).hexdigest()[:12]
+
+
+def area_label() -> str:
+    if WHOLE_COUNTY:
+        return f"весь {COUNTY.capitalize()}s län"
+    return ", ".join(m.split(" > ")[-1] for m in MUNICIPALITIES)
+
+
+def build_payload(page: int) -> dict:
     return {
         "searches": [
             {
@@ -54,19 +76,19 @@ def build_payload() -> dict:
                 "filter_by": (
                     "objectTypeGroup:housing && (language:sv || isMissingTranslation:=true)"
                     " && objectType:rental"
-                    f" && (location.municipality:=[{munis}])"
+                    f" && {location_filter()}"
                 ),
-                "page": 1,
-                "per_page": 100,
+                "page": page,
+                "per_page": PER_PAGE,
             }
         ]
     }
 
 
-def fetch_objects() -> list[dict]:
+def fetch_page(page: int) -> dict:
     req = urllib.request.Request(
         SEARCH_URL,
-        data=json.dumps(build_payload()).encode("utf-8"),
+        data=json.dumps(build_payload(page)).encode("utf-8"),
         headers={"Content-Type": "application/json", "Origin": "https://www.balder.se"},
         method="POST",
     )
@@ -75,7 +97,18 @@ def fetch_objects() -> list[dict]:
     result = data["results"][0]
     if "hits" not in result:  # Typesense вернул ошибку внутри результата
         raise RuntimeError(f"Неожиданный ответ поиска: {str(result)[:300]}")
-    return [hit["document"] for hit in result["hits"]]
+    return result
+
+
+def fetch_objects() -> list[dict]:
+    docs: list[dict] = []
+    for page in range(1, MAX_PAGES + 1):
+        result = fetch_page(page)
+        hits = result["hits"]
+        docs.extend(h["document"] for h in hits)
+        if len(docs) >= result.get("found", 0) or len(hits) < PER_PAGE:
+            break
+    return docs
 
 
 def first(value, default=None):
@@ -85,11 +118,16 @@ def first(value, default=None):
     return value if value is not None else default
 
 
+def listing_url(doc: dict) -> str:
+    return f"https://www.balder.se/bostader/{doc['sourceId']}"
+
+
 def format_message(doc: dict) -> str:
     rent = first(doc.get("rentOrFee"))
     rent_txt = f"{rent:,}".replace(",", " ") + " kr/мес" if rent else "цена не указана"
+    place = doc.get("territory") or doc.get("city", "")
     lines = [
-        f"🏠 <b>Новая квартира · {html.escape(doc.get('territory') or doc.get('city', ''))}</b>",
+        f"🏠 <b>Новая квартира · {html.escape(place)}</b>",
         f"{html.escape(doc.get('street', ''))} — {html.escape(doc.get('title', ''))}",
         f"{rent_txt} · этаж {doc.get('floor', '?')} · въезд {doc.get('access', '?')}",
         f"Объект {html.escape(doc.get('objectNumber', ''))}",
@@ -97,7 +135,7 @@ def format_message(doc: dict) -> str:
     if doc.get("publishedAt"):
         pub = datetime.fromtimestamp(doc["publishedAt"], TZ).strftime("%d.%m")
         lines.append(f"Опубликовано: {pub}")
-    lines.append(f'<a href="{html.escape(LIST_PAGE)}">Открыть список на balder.se</a>')
+    lines.append(f'<a href="{html.escape(listing_url(doc))}">Открыть объявление</a>')
     return "\n".join(lines)
 
 
@@ -108,7 +146,8 @@ def send_telegram(text: str) -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     body = urllib.parse.urlencode(
-        {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+         "disable_web_page_preview": "true"}
     ).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST"
@@ -117,26 +156,46 @@ def send_telegram(text: str) -> None:
         resp.read()
 
 
-def load_seen():
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return None  # None = первый запуск
+def load_state():
+    """Возвращает (сигнатура_фильтра, множество_id) или (None, None) при первом запуске.
+
+    Старый формат файла (простой список id) считается «неизвестным фильтром»,
+    поэтому при первом запуске новой версии бот тихо перезапоминает объекты.
+    """
+    if not STATE_FILE.exists():
+        return None, None
+    raw = json.loads(STATE_FILE.read_text())
+    if isinstance(raw, dict):
+        return raw.get("filter"), set(raw.get("ids", []))
+    return None, None
 
 
-def save_seen(seen: set) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(seen), indent=1))
+def save_state(ids: set) -> None:
+    STATE_FILE.write_text(
+        json.dumps({"filter": filter_signature(), "ids": sorted(ids)}, indent=1)
+    )
+
+
+def breakdown(docs: list[dict]) -> str:
+    counts = Counter(
+        (d.get("location", {}).get("municipality") or "?").split(" > ")[-1] for d in docs
+    )
+    return ", ".join(f"{name}: {n}" for name, n in counts.most_common(15))
 
 
 def main() -> int:
     docs = fetch_objects()
     current = {d["sourceId"]: d for d in docs}
-    seen = load_seen()
+    saved_filter, seen = load_state()
 
-    if seen is None:  # первый запуск: запоминаем текущее, не спамим
-        save_seen(set(current))
+    if seen is None or saved_filter != filter_signature():
+        # первый запуск или смена фильтра: запоминаем текущее, не спамим
+        save_state(set(current))
         send_telegram(
-            f"✅ Слежение запущено. Сейчас в {', '.join(m.split(' > ')[1] for m in MUNICIPALITIES)}"
-            f" объектов: {len(current)}. Буду писать о новых."
+            f"✅ Слежение обновлено. Область: {area_label()}.\n"
+            f"Сейчас объектов: {len(current)}.\n"
+            f"По районам: {breakdown(docs) or '—'}.\n"
+            "Буду писать о новых."
         )
         return 0
 
@@ -150,7 +209,7 @@ def main() -> int:
             sent.add(doc["sourceId"])
     finally:
         # запоминаем только то, что реально отправили, остальное повторим в след. раз
-        save_seen(seen | sent | (set(current) - set(new_ids)))
+        save_state(seen | sent | (set(current) - set(new_ids)))
     print(f"Объектов: {len(current)}, новых: {len(new_docs)}")
     return 0
 
