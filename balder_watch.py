@@ -12,7 +12,10 @@ import hashlib
 import html
 import json
 import os
+import signal
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,11 +38,18 @@ COUNTY = "stockholm"
 MUNICIPALITIES = [
     "stockholm > sundbyberg",
     "stockholm > järfälla",
-    "stockholm > botkyrka",  # Tumba; написание по аналогии, проверяется сообщением при запуске
 ]
+# Фильтры как на сайте. None = не ограничивать.
+MAX_RENT = None    # аренда в месяц, kr (включительно)
+MAX_ROOMS = None  # число комнат (включительно)
 # Можно менять эти настройки в любой момент: при изменении фильтра бот
 # тихо запомнит текущие объекты и не завалит тебя старыми квартирами.
 # ──────────────────────────────────────────────────────────────
+
+REQUEST_TIMEOUT = 15      # секунд на один сетевой запрос
+RETRIES = 3               # сколько раз пробуем запрос, прежде чем сдаться
+TOTAL_DEADLINE = 50       # общий лимит на весь запуск, секунд
+socket.setdefaulttimeout(REQUEST_TIMEOUT)
 
 PER_PAGE = 250
 MAX_PAGES = 10
@@ -54,15 +64,37 @@ def location_filter() -> str:
     return f"(location.municipality:=[{munis}])"
 
 
+def extra_filters() -> str:
+    parts = []
+    if MAX_RENT is not None:
+        parts.append(f"rentOrFee:<={MAX_RENT}")
+    if MAX_ROOMS is not None:
+        parts.append(f"numberOfRooms:<={MAX_ROOMS}")
+    return "".join(f" && {p}" for p in parts)
+
+
+def full_filter() -> str:
+    return (
+        "objectTypeGroup:housing && (language:sv || isMissingTranslation:=true)"
+        " && objectType:rental"
+        f" && {location_filter()}{extra_filters()}"
+    )
+
+
 def filter_signature() -> str:
     """Короткий отпечаток текущего фильтра, чтобы заметить его смену."""
-    return hashlib.sha1(location_filter().encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1((location_filter() + extra_filters()).encode("utf-8")).hexdigest()[:12]
 
 
 def area_label() -> str:
-    if WHOLE_COUNTY:
-        return f"весь {COUNTY.capitalize()}s län"
-    return ", ".join(m.split(" > ")[-1] for m in MUNICIPALITIES)
+    area = (f"весь {COUNTY.capitalize()}s län" if WHOLE_COUNTY
+            else ", ".join(m.split(" > ")[-1] for m in MUNICIPALITIES))
+    limits = []
+    if MAX_RENT is not None:
+        limits.append(f"аренда до {MAX_RENT:,}".replace(",", " "))
+    if MAX_ROOMS is not None:
+        limits.append(f"до {MAX_ROOMS} комнат")
+    return area + (f" ({', '.join(limits)})" if limits else "")
 
 
 def build_payload(page: int) -> dict:
@@ -73,11 +105,7 @@ def build_payload(page: int) -> dict:
                 "q": "*",
                 "query_by": "street,title,objectNumber",
                 "sort_by": "sort_weight:desc,createdAt:desc",
-                "filter_by": (
-                    "objectTypeGroup:housing && (language:sv || isMissingTranslation:=true)"
-                    " && objectType:rental"
-                    f" && {location_filter()}"
-                ),
+                "filter_by": full_filter(),
                 "page": page,
                 "per_page": PER_PAGE,
             }
@@ -85,15 +113,32 @@ def build_payload(page: int) -> dict:
     }
 
 
+def with_retries(func):
+    """Повторяет сетевую операцию при сбоях сети и таймаутах."""
+    last = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return func()
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
+            last = e
+            print(f"Попытка {attempt}/{RETRIES} не удалась: {e}", file=sys.stderr)
+            if attempt < RETRIES:
+                time.sleep(2 * attempt)
+    raise last
+
+
 def fetch_page(page: int) -> dict:
-    req = urllib.request.Request(
-        SEARCH_URL,
-        data=json.dumps(build_payload(page)).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Origin": "https://www.balder.se"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.load(resp)
+    def call():
+        req = urllib.request.Request(
+            SEARCH_URL,
+            data=json.dumps(build_payload(page)).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Origin": "https://www.balder.se"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            return json.load(resp)
+
+    data = with_retries(call)
     result = data["results"][0]
     if "hits" not in result:  # Typesense вернул ошибку внутри результата
         raise RuntimeError(f"Неожиданный ответ поиска: {str(result)[:300]}")
@@ -149,11 +194,14 @@ def send_telegram(text: str) -> None:
         {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
          "disable_web_page_preview": "true"}
     ).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        resp.read()
+    def call():
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            resp.read()
+
+    with_retries(call)
 
 
 def load_state():
@@ -183,7 +231,14 @@ def breakdown(docs: list[dict]) -> str:
     return ", ".join(f"{name}: {n}" for name, n in counts.most_common(15))
 
 
+def _deadline_hit(signum, frame):
+    raise TimeoutError(f"Запуск не уложился в {TOTAL_DEADLINE} секунд")
+
+
 def main() -> int:
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _deadline_hit)
+        signal.alarm(TOTAL_DEADLINE)
     docs = fetch_objects()
     current = {d["sourceId"]: d for d in docs}
     saved_filter, seen = load_state()
@@ -217,6 +272,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (urllib.error.URLError, RuntimeError, KeyError, json.JSONDecodeError) as e:
+    except (urllib.error.URLError, OSError, TimeoutError, RuntimeError, KeyError,
+            json.JSONDecodeError) as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
